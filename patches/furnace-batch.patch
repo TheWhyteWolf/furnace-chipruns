@@ -1,0 +1,249 @@
+diff --git a/src/engine/filePlayer.h b/src/engine/filePlayer.h
+index dde47a892..393f09ce0 100644
+--- a/src/engine/filePlayer.h
++++ b/src/engine/filePlayer.h
+@@ -22,6 +22,7 @@
+ 
+ #include "../ta-utils.h"
+ #include "../timeutils.h"
++#include <climits>
+ #include <thread>
+ #include <mutex>
+ #include <condition_variable>
+diff --git a/src/main.cpp b/src/main.cpp
+index 21f2141e4..995bc4086 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -21,6 +21,7 @@
+ #include <stdint.h>
+ #include "pch.h"
+ #ifdef HAVE_SDL2
++#include "SDL.h"
+ #include "SDL_events.h"
+ #endif
+ #include "ta-log.h"
+@@ -91,6 +92,13 @@ String vgmOutName;
+ String cmdOutName;
+ String romOutName;
+ String txtOutName;
++// furnace-chipruns batch extensions
++std::vector<String> batchInsFiles;
++int batchInsIndex=-1;
++String batchSaveAs;
++String batchJsonOut;
++String batchInsInfo;
++bool batchSysJson=false;
+ int benchMode=0;
+ int subsong=-1;
+ DivCSOptions csExportOptions;
+@@ -615,6 +623,71 @@ TAParamResult pTxtOut(String val) {
+   return TA_PARAM_SUCCESS;
+ }
+ 
++TAParamResult pInsFile(String val) {
++  batchInsFiles.push_back(val);
++  return TA_PARAM_SUCCESS;
++}
++
++TAParamResult pInsIndex(String val) {
++  try {
++    batchInsIndex=std::stoi(val);
++  } catch (std::exception& e) {
++    logE("instrument index shall be a number.");
++    return TA_PARAM_ERROR;
++  }
++  return TA_PARAM_SUCCESS;
++}
++
++TAParamResult pSaveAs(String val) {
++  batchSaveAs=val;
++  e.setAudio(DIV_AUDIO_DUMMY);
++  return TA_PARAM_SUCCESS;
++}
++
++TAParamResult pJsonOut(String val) {
++  batchJsonOut=val;
++  return TA_PARAM_SUCCESS;
++}
++
++TAParamResult pInsInfo(String val) {
++  batchInsInfo=val;
++  e.setAudio(DIV_AUDIO_DUMMY);
++  return TA_PARAM_SUCCESS;
++}
++
++TAParamResult pSysJson(String) {
++  batchSysJson=true;
++  e.setAudio(DIV_AUDIO_DUMMY);
++  return TA_PARAM_SUCCESS;
++}
++
++static String batchJsonStr(const String& in) {
++  String out="\"";
++  for (unsigned char c: in) {
++    if (c=='"' || c=='\\') {
++      out+='\\';
++      out+=(char)c;
++    } else if (c<0x20) {
++      out+=fmt::sprintf("\\u%.4x",(int)c);
++    } else {
++      out+=(char)c;
++    }
++  }
++  out+="\"";
++  return out;
++}
++
++static bool batchWriteFile(const String& path, const String& data) {
++  FILE* f=ps_fopen(path.c_str(),"wb");
++  if (f==NULL) {
++    logE("could not open %s for writing: %s",path,strerror(errno));
++    return false;
++  }
++  fwrite(data.c_str(),1,data.size(),f);
++  fclose(f);
++  return true;
++}
++
+ bool needsValue(String param) {
+   for (size_t i=0; i<params.size(); i++) {
+     if (params[i].name==param) {
+@@ -641,6 +714,12 @@ void initParams() {
+   params.push_back(TAParam("r","romout",true,pROMOut,"<filename|path>","export ROM file, or path for multi-file export"));
+   params.push_back(TAParam("R","romconf",true,pROMConf,"<key>=<value>","set configuration parameter for ROM export"));
+   params.push_back(TAParam("t","txtout",true,pTxtOut,"<filename>","export as text file"));
++  params.push_back(TAParam("","insfile",true,pInsFile,"<filename>","(batch) import instrument file into the loaded song"));
++  params.push_back(TAParam("","insindex",true,pInsIndex,"<number>","(batch) only import this instrument from multi-instrument files"));
++  params.push_back(TAParam("","saveas",true,pSaveAs,"<filename>","(batch) save the loaded song as .fur"));
++  params.push_back(TAParam("","jsonout",true,pJsonOut,"<filename>","(batch) where -sysjson/-insinfo write JSON"));
++  params.push_back(TAParam("","insinfo",true,pInsInfo,"<filename>","(batch) list instruments in an instrument file as JSON"));
++  params.push_back(TAParam("","sysjson",false,pSysJson,"","(batch) dump chip definitions as JSON"));
+   params.push_back(TAParam("L","loglevel",true,pLogLevel,"debug|info|warning|error","set the log level (info by default)"));
+   params.push_back(TAParam("v","view",true,pView,"pattern|commands|nothing","set visualization (nothing by default)"));
+   params.push_back(TAParam("i","info",false,pInfo,"","get info about a song"));
+@@ -902,12 +981,13 @@ int main(int argc, char** argv) {
+   }
+ #endif
+ 
+-  if (fileName.empty() && consoleMode) {
++  if (fileName.empty() && consoleMode && !batchSysJson && batchInsInfo.empty()) {
+     logI("usage: %s file",argv[0]);
+     return 1;
+   }
+ 
+-  const bool outputMode = outName!="" || vgmOutName!="" || cmdOutName!="" || romOutName!="" || txtOutName!="";
++  const bool audioOutputMode = outName!="" || vgmOutName!="" || cmdOutName!="" || romOutName!="" || txtOutName!="";
++  const bool outputMode = audioOutputMode || batchSaveAs!="";
+ 
+   if (fileName.empty() && (benchMode || infoMode || outputMode)) {
+     logE("provide a file!");
+@@ -943,6 +1023,50 @@ int main(int argc, char** argv) {
+     e.setAudio(DIV_AUDIO_DUMMY);
+   }
+ 
++  if (batchSysJson || !batchInsInfo.empty()) {
++    if (batchJsonOut.empty()) {
++      logE("-sysjson and -insinfo need -jsonout.");
++      return 1;
++    }
++    String out;
++    if (batchSysJson) {
++      out="[\n";
++      bool first=true;
++      for (int i=0; i<DIV_SYSTEM_MAX; i++) {
++        const DivSysDef* def=e.getSystemDef((DivSystem)i);
++        if (def==NULL) continue;
++        if (!first) out+=",\n";
++        first=false;
++        out+=fmt::sprintf("{\"enum\":%d,\"id\":%d,\"name\":%s,\"channels\":%d,\"minChans\":%d,\"maxChans\":%d,\"compound\":%s,\"fm\":%s,\"sampleFormatMask\":%u,\"waveWidth\":%d,\"waveHeight\":%d,\"description\":%s,\"chans\":[",
++          i,(int)def->id,batchJsonStr(def->name?def->name:""),def->channels,def->minChans,def->maxChans,
++          def->isCompound?"true":"false",def->isFM?"true":"false",def->sampleFormatMask,
++          (int)def->waveWidth,(int)def->waveHeight,batchJsonStr(def->description?def->description:""));
++        for (int j=0; j<def->channels; j++) {
++          DivChanDef cd=def->getChanDef(j);
++          if (j) out+=",";
++          out+=fmt::sprintf("{\"name\":%s,\"short\":%s,\"type\":%d,\"ins\":[%d,%d]}",
++            batchJsonStr(cd.name),batchJsonStr(cd.shortName),cd.type,(int)cd.insType[0],(int)cd.insType[1]);
++        }
++        out+="]}";
++      }
++      out+="\n]\n";
++    } else {
++      std::vector<DivInstrument*> list=e.instrumentFromFile(batchInsInfo.c_str(),false,true);
++      out="[";
++      for (size_t i=0; i<list.size(); i++) {
++        if (i) out+=",";
++        out+=fmt::sprintf("{\"index\":%d,\"name\":%s,\"type\":%d}",(int)i,batchJsonStr(list[i]->name),(int)list[i]->type);
++        delete list[i];
++      }
++      out+="]\n";
++      if (list.empty()) {
++        logE("no instruments loaded from %s: %s",batchInsInfo,e.getLastError());
++      }
++    }
++    finishLogFile();
++    return batchWriteFile(batchJsonOut,out)?0:1;
++  }
++
+ #if defined(HAVE_SDL2) && defined(ANDROID)
+   if (e.getConfInt("backgroundPlay",0)!=0) {
+     SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE,"0");
+@@ -1031,6 +1155,58 @@ int main(int argc, char** argv) {
+     e.changeSongP(subsong);
+   }
+ 
++  if (!batchInsFiles.empty() || !batchSaveAs.empty()) {
++    for (String& path: batchInsFiles) {
++      std::vector<DivInstrument*> list=e.instrumentFromFile(path.c_str(),true,true);
++      if (list.empty()) {
++        logE("could not load instrument file %s: %s",path,e.getLastError());
++        finishLogFile();
++        return 1;
++      }
++      if (batchInsIndex>=(int)list.size()) {
++        logE("instrument index %d out of range (%d in file)",batchInsIndex,(int)list.size());
++        for (DivInstrument* i: list) delete i;
++        finishLogFile();
++        return 1;
++      }
++      for (size_t i=0; i<list.size(); i++) {
++        if (batchInsIndex<0 || (int)i==batchInsIndex) {
++          if (e.addInstrumentPtr(list[i])<0) {
++            logE("too many instruments!");
++            finishLogFile();
++            return 1;
++          }
++        } else {
++          delete list[i];
++        }
++      }
++    }
++    if (!batchSaveAs.empty()) {
++      SafeWriter* w=e.saveFur();
++      if (w==NULL) {
++        logE("could not save song: %s",e.getLastError());
++        finishLogFile();
++        return 1;
++      }
++      FILE* f=ps_fopen(batchSaveAs.c_str(),"wb");
++      if (f==NULL) {
++        logE("could not open %s for writing: %s",batchSaveAs,strerror(errno));
++        w->finish();
++        delete w;
++        finishLogFile();
++        return 1;
++      }
++      fwrite(w->getFinalBuf(),1,w->size(),f);
++      fclose(f);
++      w->finish();
++      delete w;
++    }
++    if (!audioOutputMode) {
++      finishLogFile();
++      return 0;
++    }
++  }
++
+   if (benchMode) {
+     logI("starting benchmark!");
+     if (benchMode==3) {

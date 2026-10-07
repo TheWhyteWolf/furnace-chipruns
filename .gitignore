@@ -1,0 +1,6 @@
+/bin/
+/out/
+/vendor/furnace/
+__pycache__/
+*.py[cod]
+*.log
